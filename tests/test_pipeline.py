@@ -235,3 +235,84 @@ class EdgeCaseTests(Workspace):
             fh.write('{"export": {"events": [ {"id": "D-1"')
         out = self.one("Officer Lee first observed the blue sedan at about 21:14.")
         self.assertNotEqual(out[0]["finding"], "conflict")
+
+
+class ReportWordingTests(Workspace):
+    """Report phrasings that must not produce a confident wrong answer."""
+    D = "Incident 2026-03-02. "
+
+    def verdict(self, text, i=0):
+        self.write_report(self.D + text)
+        return self.run_tool()["findings"][i]["finding"]
+
+    def test_comparative_speed(self):
+        self.assertEqual(self.verdict("Officer Lee saw the sedan travelling over 55 mph."), "match")
+        self.assertEqual(self.verdict("Officer Lee saw the sedan travelling under 40 mph."), "conflict")
+
+    def test_speed_limit_is_not_the_speed(self):
+        self.assertEqual(self.verdict("In a posted 45 mph limit area the sedan was doing 58 mph."), "match")
+
+    def test_miles_per_hour(self):
+        self.assertEqual(self.verdict("The sedan was doing 58 miles per hour in a 45 zone."), "match")
+
+    def test_within_and_range(self):
+        self.assertEqual(self.verdict("A unit was on scene within 3 minutes of the stop."), "match")
+        self.assertEqual(self.verdict("A unit arrived on scene between 21:16 and 21:18."), "match")
+
+    def test_two_times_in_one_clause_are_two_claims(self):
+        self.write_report(self.D + "Dispatch logged the 911 call at 21:10 and the unit arrived on scene at 21:17.")
+        f = self.run_tool()["findings"]
+        self.assertEqual([x["finding"] for x in f], ["match", "match"])
+
+    def test_times_with_seconds(self):
+        self.assertEqual(self.verdict("A 911 call was logged at 21:10:19."), "match")
+        self.assertEqual(self.verdict("A 911 call was logged at 21:12:19."), "conflict")
+
+    def test_reached_the_scene(self):
+        self.assertEqual(self.verdict("The unit reached the scene at about 21:17."), "match")
+
+
+class MisleadingRecordTests(Workspace):
+    D = "Incident 2026-03-02. "
+
+    def verdict(self, text):
+        self.write_report(self.D + text)
+        return self.run_tool()["findings"][0]["finding"]
+
+    def test_officers_own_speed_is_not_the_suspects(self):
+        with open(os.path.join(self.rec, "bodycam_transcript.vtt"), "w") as fh:
+            fh.write("WEBVTT\n\n00:00.000 --> 00:04.000\nOfficer Lee: Responding, I'm doing 80 mph on Route 21.\n")
+        self.assertNotEqual(self.verdict("The sedan was travelling 58 mph."), "conflict")
+
+    def test_event_from_another_day_is_not_a_conflict(self):
+        p = os.path.join(self.rec, "dispatch.json")
+        with open(p) as fh:
+            text = fh.read()
+        with open(p, "w") as fh:
+            fh.write(text.replace('"2026-03-02 21:10:19"', '"2026-03-03 21:10:19"'))
+        self.assertEqual(self.verdict("A 911 call was logged at 21:11."), "not_settled")
+
+
+class FormatTests(Workspace):
+    D = "Incident 2026-03-02. "
+
+    def verdict(self, text):
+        self.write_report(self.D + text)
+        return self.run_tool()["findings"][0]
+
+    def test_utf16_semicolon_and_12h_notes(self):
+        p = os.path.join(self.rec, "notes_cp1252.csv")
+        with open(p, "wb") as fh:
+            fh.write("ID;Author;Note;Time\r\nN-1;Officer Lee;Vehicle observed, plate unknown;9:15 PM\r\n"
+                     "N-2;Dispatch;Caller described vehicle weaving;9:11 PM\r\n".encode("utf-16"))
+        self.assertEqual(self.verdict("Officer Lee first observed the sedan at about 21:14.")["finding"], "match")
+
+    def test_json_lines_and_other_time_key(self):
+        os.remove(os.path.join(self.rec, "dispatch.json"))
+        with open(os.path.join(self.rec, "dispatch.jsonl"), "w") as fh:
+            fh.write('{"id":"D-1001","type":"911_call","created_at":"2026-03-02 21:10:19"}\n'
+                     '{"id":"D-1002","type":"unit_on_scene","created_at":"2026-03-02T21:17:19-05:00"}\n')
+        f = self.verdict("Dispatch records show a unit on scene roughly 2 minutes after the stop.")
+        self.assertEqual(f["finding"], "match")
+        self.assertEqual(f["cite"], {"file": "dispatch.jsonl", "row": 2})
+        self.assertEqual(f["quote"], '"created_at":"2026-03-02T21:17:19-05:00"')

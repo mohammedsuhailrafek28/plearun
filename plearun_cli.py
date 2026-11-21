@@ -7,10 +7,13 @@ import json
 import os
 import sys
 
-from verifier.loaders import LOADERS, decode_bytes, load_records, read_bytes
+from verifier.loaders import decode_bytes, load_records, raw_rows, read_bytes
 from verifier.clocks import align
 from verifier.judge import evaluate
 from verifier.timeparse import first_date
+
+
+_VERIFY_CACHE = {}
 
 
 def verify_quote(records_dir, cite, quote):
@@ -20,11 +23,12 @@ def verify_quote(records_dir, cite, quote):
     path = os.path.join(records_dir, cite["file"])
     if not os.path.isfile(path):
         return False
-    ext = os.path.splitext(path)[1].lower()
-    from verifier.timeparse import TimeContext
-    rows = LOADERS[ext](path, TimeContext(base_date=first_date("1970-01-01")))
-    row = next((r for r in rows if r.row == cite["row"]), None)
-    return bool(row) and quote in row.raw and quote in decode_bytes(read_bytes(path))
+    key = (os.path.abspath(path), os.path.getmtime(path), os.path.getsize(path))
+    if key not in _VERIFY_CACHE:
+        _VERIFY_CACHE.clear()  # keep at most one file in memory
+        _VERIFY_CACHE[key] = raw_rows(path)
+    raw = _VERIFY_CACHE[key].get(cite["row"])
+    return raw is not None and quote in raw
 
 
 def run(report_path, records_dir, explain=False):

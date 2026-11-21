@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone, date as Date
 
 ISO_OFFSET_RE = re.compile(r"[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$")
-CLOCK_RE = re.compile(r"^~?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?$")
+CLOCK_RE = re.compile(r"^~?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:([AaPp])\.?\s?[Mm]\.?)?$")
 DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 
 
@@ -31,7 +31,10 @@ def find_tz_hint(strings):
             counts[m.group(1)] = counts.get(m.group(1), 0) + 1
     if not counts:
         return None
-    return tz_from_offset(max(counts, key=counts.get))
+    # A local offset (-05:00) says more about the wall clock people wrote in than UTC "Z" does.
+    local = {k: v for k, v in counts.items() if k not in ("Z", "+00:00", "+0000")}
+    pool = local or counts
+    return tz_from_offset(max(pool, key=pool.get))
 
 
 class TimeContext:
@@ -58,6 +61,10 @@ def parse_ts(value, ctx):
         if ctx.base_date is None:
             return None
         h, mi, sec = int(m.group(1)), int(m.group(2)), m.group(3)
+        if m.group(4):
+            if not 1 <= h <= 12:
+                return None
+            h = h % 12 + (12 if m.group(4).lower() == "p" else 0)
         if h > 23 or mi > 59:
             return None
         dt = datetime(ctx.base_date.year, ctx.base_date.month, ctx.base_date.day,

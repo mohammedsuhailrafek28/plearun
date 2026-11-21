@@ -14,23 +14,25 @@ from dataclasses import dataclass, field
 
 from .timeparse import TimeContext, parse_ts, parse_vtt_time, find_tz_hint
 
-TIME_COL = re.compile(r"time|timestamp|logged|datetime|date|^ts$|^at$", re.I)
+TIME_COL = re.compile(r"time|timestamp|logged|datetime|date|^ts$|^at$|_at$|^when$|occurred|created|recorded|received", re.I)
 DEVICE_COL = re.compile(r"device|camera|^cam", re.I)
 SPEED_COL = re.compile(r"speed", re.I)
 ZONE_COL = re.compile(r"zone|limit|posted", re.I)
 SKIP_TEXT_COL = re.compile(r"^id$|_id$|author|officer|^by$|name|unit", re.I)
-JSON_TEXT_KEYS = re.compile(r"^(type|event|event_type|description|desc|note|notes|text|message|status|remarks?)$", re.I)
+JSON_TEXT_KEYS = re.compile(r"^(type|event|event_type|kind|code|category|action|description|desc|note|notes|text|message|status|remarks?)$", re.I)
 
 KIND_PATTERNS = {
     "call911": re.compile(r"\b911\b|911_call|\bcaller\b|\bcall (received|logged|in)\b", re.I),
     "dispatched": re.compile(r"\bdispatched\b|unit_dispatched|\bassigned\b", re.I),
-    "on_scene": re.compile(r"on[_ ]scene|\barrived\b|\barrival\b", re.I),
+    "on_scene": re.compile(r"on[_ ]scene|\barrived\b|\barrival\b|\b(?:at|reached|reaches|reaching) the scene\b", re.I),
     "stop": re.compile(r"\bstopp?ed\b|\bstop\b|\bpull(?:ed|ing)? (?:in|over|into)\b|\bparked\b", re.I),
     "observe": re.compile(r"\bobserv|\bspotted\b|\bfirst saw\b|\bsighted\b", re.I),
 }
 # Speech is the officer talking: relaying a caller is not the call itself.
 SPEECH_KINDS = {"stop", "observe"}
 
+VEHICLE_WORDS = re.compile(r"\b(?:sedan|vehicle|car|suspect|driver|target|clocked|radar|lidar|paced|doing \d+ in)\b|\b\d{2,3}\s*(?:mph\s*)?in an? \d{2,3}\b", re.I)
+SELF_SPEED = re.compile(r"\b(?:i'?m|i am|we'?re|we are|unit (?:is )?(?:doing|travell?ing)|responding|en route|code 3)\b", re.I)
 SPEED_IN_ZONE = re.compile(r"\b(\d{2,3})\s*(?:mph)?\s+in\s+an?\s+(\d{2,3})\b", re.I)
 SPEED_MPH = re.compile(r"\b(\d{2,3})\s*mph\b", re.I)
 ZONE_TEXT = re.compile(r"\b(\d{2,3})\s*(?:mph\s+)?zone\b|\bposted\s+(\d{2,3})|\blimit\s+(?:of\s+)?(\d{2,3})", re.I)
@@ -61,6 +63,7 @@ class Row:
     zone: int = None
     kinds: set = field(default_factory=set)
     suspicious: bool = False
+    about_vehicle: bool = True   # a speed statement plainly about the observed vehicle
     time_field_raw: str = ""   # exact text of the timestamp as it appears in the raw row
 
     @property
@@ -75,6 +78,8 @@ def read_bytes(path):
 
 def decode_bytes(data):
     """UTF-8 (with or without BOM) first, then Windows-1252, never fail."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -95,6 +100,7 @@ def classify(row):
     if row.source == "camera" and row.speed == 0:
         row.kinds.add("stop")
     if row.source != "camera":
+        row.about_vehicle = bool(VEHICLE_WORDS.search(row.text)) and not SELF_SPEED.search(row.text)
         m = SPEED_IN_ZONE.search(row.text)
         if m:
             row.speed, row.zone = int(m.group(1)), int(m.group(2))
@@ -122,7 +128,9 @@ def load_csv(path, ctx):
     while start < len(lines) and (not lines[start].strip() or lines[start].lstrip().startswith("#")):
         start += 1
     body_lines = lines[start:]
-    reader = csv.reader(io.StringIO("\n".join(body_lines)))
+    head = body_lines[0] if body_lines else ""
+    delim = max(",;\t|", key=head.count) if head else ","
+    reader = csv.reader(io.StringIO("\n".join(body_lines)), delimiter=delim)
     try:
         header = [h.strip() for h in next(reader)]
     except StopIteration:
@@ -164,23 +172,23 @@ def load_csv(path, ctx):
     return dedupe(rows)
 
 
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[{}\[\]]')
+
+
 def _json_dict_spans(text):
-    """Character spans of every JSON object that is a direct element of an array, in document order."""
-    spans, stack, i, n = [], [], 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-        elif c in "{[":
-            stack.append((c, i))
-        elif c in "}]":
-            if stack:
-                kind, s = stack.pop()
-                if kind == "{" and stack and stack[-1][0] == "[":
-                    spans.append((s, i + 1))
-        i += 1
+    """Character spans of every JSON object that is a direct element of an array, in document order.
+    Strings are skipped whole by the regex, so braces inside text never confuse it."""
+    spans, stack = [], []
+    for m in JSON_TOKEN.finditer(text):
+        c = m.group(0)
+        if c[0] == '"':
+            continue
+        if c in "{[":
+            stack.append((c, m.start()))
+        elif stack:
+            kind, st = stack.pop()
+            if kind == "{" and stack and stack[-1][0] == "[":
+                spans.append((st, m.end()))
     return sorted(spans)
 
 
@@ -199,22 +207,39 @@ def _json_array_dicts(obj, out):
 def load_json(path, ctx):
     name = os.path.basename(path)
     text = decode_bytes(read_bytes(path))
+    line_spans = None
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return []
+        # JSON Lines: one object per line -> treat as an array of objects
+        objs, line_spans, offset = [], [], 0
+        for ln in text.splitlines(keepends=True):
+            body = ln.strip()
+            if body:
+                start = offset + ln.index(body)
+                try:
+                    objs.append(json.loads(body))
+                except json.JSONDecodeError:
+                    objs.append({})  # keep numbering aligned with lines
+                line_spans.append((start, start + len(body)))
+            offset += len(ln)
+        if not any(objs):
+            return []
+        data = objs
     dicts = []
     _json_array_dicts(data, dicts)
     spans = _json_dict_spans(text)
-    if len(spans) != len(dicts):  # should not happen; fall back to re-serialised text
-        spans = None
+    if line_spans is not None and len(line_spans) == len(dicts):
+        spans = line_spans  # JSON Lines: each row's raw text is its own line
+    if len(spans) != len(dicts):  # never cite text we cannot locate in the file
+        return []
     rows = []
     for idx, d in enumerate(dicts):
         # row = 1-based position among all objects inside arrays, in document order
         tkey = next((k for k in d if TIME_COL.search(k) and parse_ts(d[k], ctx)), None)
         if tkey is None:
             continue
-        raw = text[spans[idx][0]:spans[idx][1]] if spans else json.dumps(d)
+        raw = text[spans[idx][0]:spans[idx][1]]
         r = Row(file=name, row=idx + 1, raw=raw, source="log", device=name)
         r.t, r.prec, r.relative = parse_ts(d[tkey], ctx)
         # the exact key/value text, e.g.  "logged": "2026-03-02T21:17:19-05:00"
@@ -267,7 +292,8 @@ def dedupe(rows):
     return out
 
 
-LOADERS = {".csv": load_csv, ".tsv": load_csv, ".json": load_json, ".vtt": load_vtt}
+LOADERS = {".csv": load_csv, ".tsv": load_csv, ".json": load_json, ".jsonl": load_json,
+           ".ndjson": load_json, ".vtt": load_vtt}
 
 
 def load_records(records_dir, base_date=None):
@@ -276,16 +302,67 @@ def load_records(records_dir, base_date=None):
         if os.path.splitext(f)[1].lower() in LOADERS
     )
     # first pass: learn the local UTC offset from any ISO timestamps in the files
-    sample = []
-    for p in paths:
-        sample += re.findall(r"\d{4}-\d{2}-\d{2}[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})",
-                             decode_bytes(read_bytes(p)))
-    ctx = TimeContext(tz=find_tz_hint(sample), base_date=base_date)
+    iso = re.compile(r"\d{4}-\d{2}-\d{2}[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})")
+    per_file = {p: iso.findall(decode_bytes(read_bytes(p))) for p in paths}
+    ctx = TimeContext(tz=find_tz_hint(sum(per_file.values(), [])), base_date=base_date)
     rows = []
     for p in paths:
+        # naive/epoch values in a file take that file's own local offset when it shows one
+        fctx = TimeContext(tz=find_tz_hint(per_file[p]) or ctx.tz, base_date=base_date)
         try:
-            rows += LOADERS[os.path.splitext(p)[1].lower()](p, ctx)
+            rows += LOADERS[os.path.splitext(p)[1].lower()](p, fctx)
         except Exception as exc:  # one unreadable file must not take down the others
             import sys
             print(f"skipped {os.path.basename(p)}: {exc}", file=sys.stderr)
     return rows, ctx
+
+
+# ---------------------------------------------------------------- raw rows for quote verification
+def raw_rows(path):
+    """{row number: exact raw text} without interpreting anything. Used only to verify quotes,
+    so it shares numbering rules with the loaders but none of their parsing of meaning."""
+    ext = os.path.splitext(path)[1].lower()
+    text = decode_bytes(read_bytes(path))
+    if ext in (".csv", ".tsv"):
+        lines = text.splitlines()
+        start = 0
+        while start < len(lines) and (not lines[start].strip() or lines[start].lstrip().startswith("#")):
+            start += 1
+        body = lines[start:]
+        if not body:
+            return {}
+        reader = csv.reader(io.StringIO("\n".join(body)), delimiter=max(",;\t|", key=body[0].count))
+        next(reader, None)
+        out, n, prev = {}, 0, reader.line_num
+        for rec in reader:
+            raw = "\n".join(body[prev:reader.line_num]).strip("\r\n")
+            prev = reader.line_num
+            if not rec or not any(c.strip() for c in rec) or rec[0].lstrip().startswith("#"):
+                continue
+            n += 1
+            out[n] = raw
+        return out
+    if ext in (".json", ".jsonl", ".ndjson"):
+        try:
+            json.loads(text)
+            spans = _json_dict_spans(text)
+        except json.JSONDecodeError:
+            spans, offset = [], 0
+            for ln in text.splitlines(keepends=True):
+                body = ln.strip()
+                if body:
+                    st = offset + ln.index(body)
+                    spans.append((st, st + len(body)))
+                offset += len(ln)
+        return {i + 1: text[a:b] for i, (a, b) in enumerate(spans)}
+    if ext == ".vtt":
+        out, n = {}, 0
+        for b in re.split(r"\n\s*\n", text.replace("\r\n", "\n")):
+            lines = [ln for ln in b.split("\n") if ln.strip()]
+            ti = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+            if ti is None or parse_vtt_time(lines[ti].partition("-->")[0]) is None:
+                continue
+            n += 1
+            out[n] = "\n".join(lines[ti + 1:])
+        return out
+    return {}
