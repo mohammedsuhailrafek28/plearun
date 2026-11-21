@@ -185,3 +185,53 @@ class TimeParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EdgeCaseTests(Workspace):
+    D = "Incident 2026-03-02. "
+
+    def one(self, text):
+        self.write_report(self.D + text)
+        return self.run_tool()["findings"]
+
+    def test_time_at_start_of_sentence_stays_with_event(self):
+        f = self.one("At about 21:14, Officer Lee observed the blue sedan.")
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["finding"], "match")
+
+    def test_abbreviation_is_not_a_sentence_end(self):
+        f = self.one("A unit arrived on scene approx. 2 minutes after the stop.")
+        self.assertEqual([x["finding"] for x in f], ["match"])
+
+    def test_twelve_hour_clock(self):
+        self.assertEqual(self.one("The driver stopped at about 9:16 p.m. in the lot.")[0]["finding"], "match")
+        self.assertEqual(self.one("The driver stopped at about 9:40 p.m. in the lot.")[0]["finding"], "conflict")
+
+    def test_json_rows_are_array_positions(self):
+        p = os.path.join(self.rec, "dispatch.json")
+        with open(p) as fh:
+            d = json.load(fh)
+        d["export"]["events"].insert(0, {"id": "D-0999", "type": "note", "text": "no time"})
+        with open(p, "w") as fh:
+            fh.write(json.dumps(d))  # minified, one line
+        f = self.one("Dispatch records show a unit on scene roughly 2 minutes after the stop.")[0]
+        self.assertEqual(f["cite"], {"file": "dispatch.json", "row": 3})
+        self.assertEqual(f["quote"], '"logged": "2026-03-02T21:17:19-05:00"')
+
+    def test_separate_date_and_time_columns(self):
+        with open(os.path.join(self.rec, "notes_cp1252.csv"), "w", encoding="cp1252") as fh:
+            fh.write("ID,Author,Note,Date,Time\r\n"
+                     "N-1,Officer Lee,\"Vehicle observed, plate unknown\",2026-03-02,21:15\r\n"
+                     "N-2,Dispatch,Caller described vehicle weaving,2026-03-02,21:11\r\n")
+        self.assertEqual(self.one("Officer Lee first observed the blue sedan at about 21:14.")[0]["finding"], "match")
+
+    def test_empty_records_dir_does_not_crash(self):
+        for f in os.listdir(self.rec):
+            os.remove(os.path.join(self.rec, f))
+        self.assertEqual(self.one("The 911 call was logged at 21:10.")[0]["finding"], "not_checkable")
+
+    def test_broken_json_file_is_skipped(self):
+        with open(os.path.join(self.rec, "dispatch.json"), "w") as fh:
+            fh.write('{"export": {"events": [ {"id": "D-1"')
+        out = self.one("Officer Lee first observed the blue sedan at about 21:14.")
+        self.assertNotEqual(out[0]["finding"], "conflict")

@@ -6,7 +6,7 @@
 `--explain` prints the clock offsets and the evidence behind every verdict to stderr.
 
 ## How it works
-1. **Load** (`verifier/loaders.py`). CSV: UTF-8/BOM first, then Windows-1252; `#` marker lines skipped; columns found by name. JSON: every object inside an array that has a parseable time. WebVTT: cues numbered from 1 (header, `NOTE`s and cue IDs ignored). Every row keeps its **exact raw text**. Duplicate readings (the same camera row exported as ISO and as epoch) count once.
+1. **Load** (`verifier/loaders.py`). CSV: UTF-8/BOM first, then Windows-1252; `#` marker lines skipped; columns found by name. JSON: every object inside an array that has a parseable time. WebVTT: cues numbered from 1 (header, `NOTE`s and cue IDs ignored). Every row keeps its **exact raw text**. Duplicate readings (the same camera row exported as ISO and as epoch) count once. Row numbers: CSV = data row (1 = first row after the header), JSON = position among objects inside arrays, WebVTT = cue number.
 2. **Time** (`timeparse.py`). Epoch ms/s, ISO with offset, naive datetimes and `HH:MM` all become Unix seconds with a precision (1 s or 60 s). Naive and epoch values take the UTC offset that most ISO strings in the pack use.
 3. **Clocks** (`clocks.py`). The dispatch export is the reference. Another device gets an offset only from an event kind that appears **exactly once** in both devices (911 call, dispatch, on scene, stop). Several anchors must agree within their uncertainty or the device stays unaligned. Unaligned devices never decide a verdict. Sample: notes +41 s (from the 911 call), bodycam aligned via the stop, CAM-03 ~-1 s and CAM-07 ~+89 s via their single zero-speed rows.
 4. **Claims** (`judge.py`). The report is split into sentences and clauses, so each claim is copied verbatim. Facts pulled out: event time (with or without "about"), interval between two events, speed and posted limit, location, and lane/count.
@@ -20,7 +20,7 @@
 
 ## What it gets wrong
 - Claim and event recognition is keyword-based. Unusual wording ("arrived at the forecourt") can be missed, which shows up as `not_checkable`, not as a wrong verdict.
-- It assumes one wall-clock zone for the whole incident and does not handle a report that crosses midnight.
+- It assumes one wall-clock zone for the whole incident and does not handle a report that crosses midnight. 12-hour times ("9:16 p.m.") are handled; "2116 hrs" is not.
 - The bodycam's "58 in a 45" is the officer confirming himself. It is a record, but not an independent one.
 
 ## What breaks first on real records

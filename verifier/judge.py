@@ -11,7 +11,7 @@ from .clocks import true_time
 from .loaders import KIND_PATTERNS, Row
 
 HEDGE = r"(?:about|around|approximately|approx\.?|roughly|circa|some|~)"
-TIME_FACT = re.compile(rf"(?:({HEDGE})\s*)?\b(\d{{1,2}}):(\d{{2}})\b", re.I)
+TIME_FACT = re.compile(rf"(?:({HEDGE})\s*)?\b(\d{{1,2}}):(\d{{2}})\b(?:\s*([ap])\.?\s?m\b\.?)?", re.I)
 DURATION_FACT = re.compile(
     rf"(?:({HEDGE})\s+)?(\d+(?:\.\d+)?)\s*(minutes?|mins?|seconds?|secs?)\s+(after|later than|before)\s+(?:the\s+)?([a-z0-9_ ]+?)\b(?:\.|,|$|\s)",
     re.I)
@@ -42,20 +42,48 @@ class Claim:
         self.text, self.sentence_idx = text, sentence_idx
 
 
+ABBREV = re.compile(r"\b(approx|approx|appx|ca|no|mr|mrs|ms|dr|st|ave|rd|hwy|vs|est)\.(?=\s)|\b([ap])\.m\.(?=\s+[a-z0-9])", re.I)
+
+
+def _has_fact(text):
+    return bool(TIME_FACT.search(text) or DURATION_FACT.search(text) or SPEED_FACT.search(text)
+                or LOCATION_FACT.search(text) or COUNT_FACT.search(text))
+
+
 def split_claims(report):
     flat = re.sub(r"\s+", " ", report).strip()
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", flat)
-    claims = []
-    for si, s in enumerate(sentences):
+    # hide abbreviation dots so "approx. 2 minutes" is not a sentence end (same length: offsets stay valid)
+    masked = ABBREV.sub(lambda m: m.group(0).replace(".", "\x00"), flat)
+    claims, pos = [], 0
+    for si, sm in enumerate(re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", masked)):
+        start = flat.index(sm.replace("\x00", "."), pos)
+        pos = start + len(sm)
+        s = flat[start:pos]
         if HEADER_SENTENCE.search(s):
             continue
         s = s.rstrip(".!? ")
-        for clause in re.split(r",\s+", s):
+        # clause spans split on ", "; a clause with no checkable fact is glued to its neighbour,
+        # so "At 21:14, Officer Lee observed the car" stays one claim
+        spans, i = [], 0
+        for m in re.finditer(r",\s+", s):
+            spans.append([i, m.start()])
+            i = m.end()
+        spans.append([i, len(s)])
+        merged = []
+        for sp in spans:
+            if merged and (not _has_fact(s[sp[0]:sp[1]]) or not _has_fact(s[merged[-1][0]:merged[-1][1]])):
+                merged[-1][1] = sp[1]
+            else:
+                merged.append(sp)
+        for a, b in merged:
+            clause = s[a:b]
             loc = LOCATION_FACT.search(clause)
-            parts = [clause[:loc.start()], clause[loc.start():].strip()] if loc else [clause]
+            parts = [clause]
+            if loc and _has_fact(clause[:loc.start()] + clause[loc.end():]):
+                parts = [clause[:loc.start()], clause[loc.start():loc.end()].strip(), clause[loc.end():]]
             for p in parts:
-                p = p.strip()
-                if len(p.split()) >= 3 or LOCATION_FACT.fullmatch(" " + p):
+                p = p.strip(" ,")
+                if p and (len(p.split()) >= 3 or LOCATION_FACT.fullmatch(" " + p)):
                     claims.append(Claim(p, si))
     return claims
 
@@ -110,6 +138,15 @@ def _exists(rows, kind):
     return any(kind in r.kinds and not r.suspicious for r in rows if r.source != "camera")
 
 
+def _collapse(cands):
+    """Several rows for one event: keep the most precise if they all agree, else None."""
+    lo = max(t - u for _, t, u in cands)
+    hi = min(t + u for _, t, u in cands)
+    if lo > hi + 1:
+        return None
+    return [min(cands, key=lambda c: c[2])]
+
+
 def judge_time(kind, claimed, hedged, rows, clocks, ctx, first=False):
     cands = _candidates(rows, clocks, kind)
     if not cands:
@@ -147,8 +184,9 @@ def judge_duration(kind_a, kind_b, claimed, hedged, rows, clocks):
         exists = _exists(rows, kind_a) and _exists(rows, kind_b)
         return Evidence("not_settled" if exists else "not_checkable",
                         why=f"need aligned {kind_a} and {kind_b} rows (have {len(a)}, {len(b)})")
-    if len(a) > 1 or len(b) > 1:
-        return Evidence("not_settled", why=f"ambiguous: {len(a)} {kind_a} and {len(b)} {kind_b} rows")
+    a, b = _collapse(a), _collapse(b)
+    if a is None or b is None:
+        return Evidence("not_settled", why=f"records disagree about when {kind_a} or {kind_b} happened")
     (ra, ta, ua), (rb, tb, ub) = a[0], b[0]
     measured, u = ta - tb, ua + ub
     tol = max(90, 0.25 * claimed) if hedged else max(30, 0.1 * claimed)
@@ -228,7 +266,10 @@ def evaluate(report, rows, clocks, ctx, log=lambda *_: None):
                 facts.append(("duration", Evidence("not_checkable", why="cannot tell which events")))
         elif tm and ctx.base_date:
             kind = claim_kind(c.text)
-            claimed = _claimed_seconds(int(tm.group(2)), int(tm.group(3)), ctx)
+            hour = int(tm.group(2))
+            if tm.group(4):
+                hour = hour % 12 + (12 if tm.group(4).lower() == "p" else 0)
+            claimed = _claimed_seconds(hour, int(tm.group(3)), ctx)
             if kind:
                 ev = judge_time(kind, claimed, bool(tm.group(1)), rows, clocks, ctx,
                                 first=bool(re.search(r"\bfirst\b", c.text, re.I)))

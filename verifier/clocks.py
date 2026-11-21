@@ -35,6 +35,8 @@ def pick_reference(by_dev):
         name = dev.lower()
         return (strong, "dispatch" in name or "cad" in name, sum(1 for r in rows if _usable(r) and not r.relative))
     cands = [d for d, rows in by_dev.items() if rows[0].source != "camera"] or list(by_dev)
+    if not cands:
+        return None
     best = max(cands, key=score)
     return best if score(best)[2] > 0 else None
 

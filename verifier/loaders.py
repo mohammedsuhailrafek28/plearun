@@ -127,11 +127,15 @@ def load_csv(path, ctx):
         header = [h.strip() for h in next(reader)]
     except StopIteration:
         return []
-    tcol = next((i for i, h in enumerate(header) if TIME_COL.search(h)), None)
+    tcols = [i for i, h in enumerate(header) if TIME_COL.search(h)]
+    tcol = tcols[0] if tcols else None
+    datecol = next((i for i in tcols if re.fullmatch(r"date", header[i], re.I)), None)
+    if datecol is not None and len(tcols) > 1:
+        tcol = next(i for i in tcols if i != datecol)
     dcol = next((i for i, h in enumerate(header) if DEVICE_COL.search(h)), None)
     scol = next((i for i, h in enumerate(header) if SPEED_COL.search(h)), None)
     zcol = next((i for i, h in enumerate(header) if ZONE_COL.search(h)), None)
-    used = {tcol, dcol, scol, zcol}
+    used = {tcol, dcol, scol, zcol, datecol}
     text_cols = [i for i, h in enumerate(header) if i not in used and not SKIP_TEXT_COL.search(h)]
     source = "camera" if scol is not None else "log"
 
@@ -147,6 +151,8 @@ def load_csv(path, ctx):
                 device=(get(dcol) or name) if source == "camera" else name)
         tval = get(tcol)
         parsed = parse_ts(tval, ctx)
+        if datecol is not None and datecol != tcol and get(datecol):
+            parsed = parse_ts(f"{get(datecol)} {tval}", ctx) or parsed
         if parsed:
             r.t, r.prec, r.relative = parsed
             r.time_field_raw = tval
@@ -202,18 +208,18 @@ def load_json(path, ctx):
     spans = _json_dict_spans(text)
     if len(spans) != len(dicts):  # should not happen; fall back to re-serialised text
         spans = None
-    rows, n = [], 0
+    rows = []
     for idx, d in enumerate(dicts):
+        # row = 1-based position among all objects inside arrays, in document order
         tkey = next((k for k in d if TIME_COL.search(k) and parse_ts(d[k], ctx)), None)
         if tkey is None:
             continue
-        n += 1
         raw = text[spans[idx][0]:spans[idx][1]] if spans else json.dumps(d)
-        r = Row(file=name, row=n, raw=raw, source="log", device=name)
+        r = Row(file=name, row=idx + 1, raw=raw, source="log", device=name)
         r.t, r.prec, r.relative = parse_ts(d[tkey], ctx)
-        # the exact line holding the timestamp, e.g.  "logged": "2026-03-02T21:17:19-05:00"
-        line = next((ln.strip().rstrip(",") for ln in raw.splitlines() if f'"{tkey}"' in ln), "")
-        r.time_field_raw = line if line and line in raw else ""
+        # the exact key/value text, e.g.  "logged": "2026-03-02T21:17:19-05:00"
+        m = re.search(r'"%s"\s*:\s*(?:"(?:[^"\\]|\\.)*"|-?[\d.eE+]+)' % re.escape(tkey), raw)
+        r.time_field_raw = m.group(0) if m else ""
         r.text = " ".join(str(v) for k, v in d.items() if JSON_TEXT_KEYS.match(k) and isinstance(v, (str, int)))
         for k in d:
             if SPEED_COL.search(k):
@@ -277,5 +283,9 @@ def load_records(records_dir, base_date=None):
     ctx = TimeContext(tz=find_tz_hint(sample), base_date=base_date)
     rows = []
     for p in paths:
-        rows += LOADERS[os.path.splitext(p)[1].lower()](p, ctx)
+        try:
+            rows += LOADERS[os.path.splitext(p)[1].lower()](p, ctx)
+        except Exception as exc:  # one unreadable file must not take down the others
+            import sys
+            print(f"skipped {os.path.basename(p)}: {exc}", file=sys.stderr)
     return rows, ctx
